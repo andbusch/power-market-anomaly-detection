@@ -253,7 +253,8 @@ class TiFeAttention(nn.Module):
         # return attention maps
         attention_maps = {
             'time_attention': self.time_attention_maps[-1],
-            'feature_attention': self.feature_attention_maps[-1]
+            'feature_attention': self.feature_attention_maps[-1],
+            'window_attention': self.window_attention_maps[-1]
         }
         
         return time_feature_extracted, attention_maps
