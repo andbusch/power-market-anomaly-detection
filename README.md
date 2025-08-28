@@ -14,7 +14,7 @@ The approach is inspired by research demonstrating the effectiveness of attentio
 - **Interpretability**: Attention maps provide transparent insights into model decision-making
 - **Domain Applicability**: Designed specifically for the unique characteristics of power market data
 
-Reference: [Attention-based anomaly detection in time series](https://www.sciencedirect.com/science/article/pii/S2666546823000642)
+Reference: [Attention boosted autoencoder for building energy anomaly detection](https://www.sciencedirect.com/science/article/pii/S2666546823000642)
 
 ## Architecture
 
@@ -60,26 +60,6 @@ Primary data source selected for transparency and data availability from [ERCOT 
 - **Solar Production**: Hourly resolution by region
 
 Future versions may incorporate additional ISO/RTO data sources as they become available.
-
-## Installation
-
-The project uses `uv` for dependency management:
-
-```bash
-# Install dependencies
-uv sync
-
-# Run the main application  
-python main.py
-
-# Alternative execution with uv
-uv run python main.py
-```
-
-## Requirements
-
-- Python >= 3.11
-- PyTorch >= 2.7.1
 
 ## Project Structure
 
@@ -174,4 +154,4 @@ This project is in active development. Key components implemented:
 
 ## Contributing
 
-[Contributing guidelines to be added]
+Don't hesitate to reach out to andbusch@umich.edu if you're interested in contributing.
