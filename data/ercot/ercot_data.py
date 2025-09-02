@@ -43,14 +43,71 @@ from pathlib import Path
 
 ERCOT_BASE_URL = "https://api.ercot.com/api/public-reports"
 
-def _make_ercot_api_call(report_id: str, date: datetime.datetime, **params) -> Optional[dict]:
+def _get_access_token() -> str:
+    """
+    returns the application token saved in the environment or gets one
+    """
+
+    username = os.environ.get("ERCOT_USERNAME")
+    password = os.environ.get("ERCOT_PASSWORD")
+
+    if not username:
+        raise ValueError("ERCOT_USERNAME environment variable is required")
+
+    if not password:
+        raise ValueError("ERCOT_PASSWORD environment variable is required")
+
+    # Check if access token exists and is still valid
+    existing_token = os.environ.get("ERCOT_ACCESS_TOKEN")
+    expires_str = os.environ.get("ERCOT_ACCESS_TOKEN_EXPIRES_IN", "")
+    expires_time = None
+
+    if existing_token and expires_str:
+        try:
+            expires_time = datetime.datetime.fromisoformat(expires_str)
+            if datetime.datetime.now() < expires_time:
+                return existing_token
+        except (ValueError, TypeError):
+            pass  # Invalid format, fetch new token
+
+    # Prepare authentication request data
+    auth_data = {
+        'username': username,
+        'password': password,
+        'grant_type': 'password',
+        'scope': 'openid fec253ea-0d06-4272-a5e6-b478baeecd70 offline_access',
+        'client_id': 'fec253ea-0d06-4272-a5e6-b478baeecd70',
+        'response_type': 'id_token'
+    }
+
+    auth_response = requests.post("https://ercotb2c.b2clogin.com/ercotb2c.onmicrosoft.com/B2C_1_PUBAPI-ROPC-FLOW/oauth2/v2.0/token", data=auth_data)
+
+    try:
+        auth_response.raise_for_status()
+    except Exception as e:
+        print(f"Error in request. Response body: {auth_response.json()}")
+        raise e
+
+    access_token = auth_response.json().get("access_token")
+
+    # Store token and expiration (60 minutes from now)
+    os.environ["ERCOT_ACCESS_TOKEN"] = access_token
+    os.environ["ERCOT_ACCESS_TOKEN_EXPIRES_IN"] = (datetime.datetime.now() + datetime.timedelta(minutes=60)).isoformat()
+
+    return access_token
+
+
+def _make_ercot_api_call(report_id: str, **params) -> Optional[dict]:
     """Make API call to ERCOT with authentication"""
-    api_key = os.getenv('ERCOT_API_KEY')
+    api_key = os.getenv('ERCOT_SUBSCRIPTION_KEY')
     if not api_key:
-        raise ValueError("ERCOT_API_KEY environment variable is required")
-    
+        raise ValueError("ERCOT_SUBSCRIPTION_KEY environment variable is required")
+
+    access_token = _get_access_token()
+
     headers = {
-        'Ocp-Apim-Subscription-Key': api_key
+        'Ocp-Apim-Subscription-Key': api_key,
+        'Authorization': f'Bearer {access_token}'
     }
     
     url = f"{ERCOT_BASE_URL}/{report_id}"
@@ -63,7 +120,18 @@ def _make_ercot_api_call(report_id: str, date: datetime.datetime, **params) -> O
     try:
         response = requests.get(url, headers=headers, params=api_params)
         response.raise_for_status()
-        return response.json()
+        json_data = response.json()
+        
+        # Save JSON response for debugging
+        debug_dir = Path("debug_json_responses")
+        debug_dir.mkdir(exist_ok=True)
+        debug_file = debug_dir / f"{report_id.replace('/', '_')}.json"
+        
+        with open(debug_file, 'w') as f:
+            json.dump(json_data, f, indent=2)
+        print(f"Saved API response to {debug_file}")
+        
+        return json_data
     except requests.RequestException as e:
         print(f"Error fetching data from ERCOT API: {e}")
         return None
@@ -127,24 +195,31 @@ def get_zonal_lmp(date: datetime.datetime, cache_data: bool) -> torch.Tensor:
         'repeatHourFlag': False
     }
 
-    api_data = _make_ercot_api_call("np6-788-cd/lmp_node_zone_hub", date, params)
+    api_data = _make_ercot_api_call("np6-788-cd/lmp_node_zone_hub", **params)
     
     if api_data is None:
         # Return default tensor if API call fails
+        print('API data is None')
         tensor = torch.zeros(1, 24, 8)
     else:
         # Process API data to tensor
         data_list = api_data.get('data', [])
-        # Filter for load zone data (LZ_*)
-        lz_data = [item for item in data_list if item.get('settlement_point_name', '').startswith('LZ_')]
         
-        # Convert to tensor
-        if lz_data:
-            df = pd.DataFrame(lz_data)
-            if 'settlement_point_price' in df.columns:
+        if data_list:
+            # Convert array format to DataFrame
+            # Fields: SCEDTimestamp, repeatHourFlag, settlementPoint, LMP
+            df = pd.DataFrame(data_list, columns=['SCEDTimestamp', 'repeatHourFlag', 'settlementPoint', 'LMP'])
+
+            df.to_csv('debug_csv_responses/zonal_lmp.csv')
+            return torch.zeros(1, 24, 8)
+            
+            # Filter for load zone data (LZ_*)
+            lz_data = df[df['settlementPoint'].str.startswith('LZ_')]
+            
+            if not lz_data.empty:
                 # Group by hour and settlement point, take mean
-                df['hour'] = pd.to_datetime(df['delivery_date']).dt.hour
-                grouped = df.groupby(['hour', 'settlement_point_name'])['settlement_point_price'].mean().unstack(fill_value=0)
+                lz_data['hour'] = pd.to_datetime(lz_data['SCEDTimestamp']).dt.hour
+                grouped = lz_data.groupby(['hour', 'settlementPoint'])['LMP'].mean().unstack(fill_value=0)
                 
                 # Ensure we have 24 hours and pad/truncate to 8 zones
                 hourly_data = torch.zeros(24, 8)
@@ -193,10 +268,11 @@ def get_actual_sys_load(date: datetime.datetime, cache_data: bool) -> torch.Tens
     }
     
     # Fetch from API
-    api_data = _make_ercot_api_call("np6-345-cd/act_sys_load_by_wzn", date, params)
+    api_data = _make_ercot_api_call("np6-345-cd/act_sys_load_by_wzn", **params)
     
     if api_data is None:
         # Return default tensor if API call fails
+        print('API data is None')
         tensor = torch.zeros(1, 24, 8)
     else:
         # Process API data to tensor
@@ -204,6 +280,11 @@ def get_actual_sys_load(date: datetime.datetime, cache_data: bool) -> torch.Tens
         
         if data_list:
             df = pd.DataFrame(data_list)
+
+            # TODO: remove
+            df.to_csv('debug_csv_responses/sys_load.csv')
+            return torch.zeros(1, 24, 8)
+
             if 'actual_system_load' in df.columns and 'weather_zone' in df.columns:
                 # Group by hour and weather zone
                 df['hour'] = pd.to_datetime(df['hour_ending']).dt.hour if 'hour_ending' in df.columns else pd.to_datetime(df['delivery_date']).dt.hour
@@ -256,10 +337,11 @@ def get_seven_day_load_forecast(date: datetime.datetime, cache_data: bool) -> to
     }
     
     # Fetch from API
-    api_data = _make_ercot_api_call("np3-565-cd/lf_by_model_weather_zone", date, params)
+    api_data = _make_ercot_api_call("np3-565-cd/lf_by_model_weather_zone", **params)
     
     if api_data is None:
         # Return default tensor if API call fails - assuming multiple models and weather zones
+        print('API data is None')
         tensor = torch.zeros(1, 24, 16)
     else:
         # Process API data to tensor
@@ -267,6 +349,11 @@ def get_seven_day_load_forecast(date: datetime.datetime, cache_data: bool) -> to
         
         if data_list:
             df = pd.DataFrame(data_list)
+
+            # TODO: remove
+            df.to_csv('debug_csv_responses/forecast_load.csv')
+            return torch.zeros(1, 24, 8)
+
             if 'forecast_load' in df.columns and 'weather_zone' in df.columns and 'model_id' in df.columns:
                 # Group by hour, weather zone, and model
                 df['hour'] = pd.to_datetime(df['hour_ending']).dt.hour if 'hour_ending' in df.columns else pd.to_datetime(df['delivery_date']).dt.hour
@@ -321,10 +408,11 @@ def get_wind_production(date: datetime.datetime, cache_data: bool) -> torch.Tens
     }
     
     # Fetch from API
-    api_data = _make_ercot_api_call("np4-743-cd/wpp_actual_5min_avg_values_geo", date, params)
+    api_data = _make_ercot_api_call("np4-743-cd/wpp_actual_5min_avg_values_geo", **params)
     
     if api_data is None:
         # Return default tensor if API call fails - assuming 4 geographical regions
+        print('API data is None')
         tensor = torch.zeros(1, 24, 4)
     else:
         # Process API data to tensor
@@ -332,6 +420,11 @@ def get_wind_production(date: datetime.datetime, cache_data: bool) -> torch.Tens
         
         if data_list:
             df = pd.DataFrame(data_list)
+
+            # TODO: remove
+            df.to_csv('debug_csv_responses/wind_production.csv')
+            return torch.zeros(1, 24, 4)
+
             if 'mw' in df.columns and 'geographical_region' in df.columns:
                 # Group by hour and geographical region, aggregating 5-minute data to hourly
                 df['hour'] = pd.to_datetime(df['interval_ending']).dt.hour if 'interval_ending' in df.columns else pd.to_datetime(df['delivery_date']).dt.hour
@@ -383,10 +476,11 @@ def get_solar_production(date: datetime.datetime, cache_data: bool) -> torch.Ten
     }
     
     # Fetch from API
-    api_data = _make_ercot_api_call("np4-746-cd/spp_actual_5min_avg_values_geo", date, params)
+    api_data = _make_ercot_api_call("np4-746-cd/spp_actual_5min_avg_values_geo", **params)
     
     if api_data is None:
         # Return default tensor if API call fails - assuming 4 geographical regions
+        print('API data is None')
         tensor = torch.zeros(1, 24, 4)
     else:
         # Process API data to tensor
@@ -394,6 +488,11 @@ def get_solar_production(date: datetime.datetime, cache_data: bool) -> torch.Ten
         
         if data_list:
             df = pd.DataFrame(data_list)
+
+            # TODO: remove
+            df.to_csv('debug_csv_responses/solar_production.csv')
+            return torch.zeros(1, 24, 4)
+
             if 'mw' in df.columns and 'geographical_region' in df.columns:
                 # Group by hour and geographical region, aggregating 5-minute data to hourly
                 df['hour'] = pd.to_datetime(df['interval_ending']).dt.hour if 'interval_ending' in df.columns else pd.to_datetime(df['delivery_date']).dt.hour
@@ -468,3 +567,9 @@ def get_processed_ercot_data(start_date: str, end_date: str, window_size: int = 
     # Yield remainder
     if daily_tensors:
         yield torch.cat(daily_tensors, dim=0)  # (remainder_size, window_size, num_features)
+
+
+# TODO: remove
+if __name__ == "__main__":
+    for t in get_processed_ercot_data("2024-01-01", "2024-01-01", window_size=24, batch_size=32, cache_data=False):
+        print(t.shape)
